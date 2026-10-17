@@ -82,6 +82,13 @@ function authorize(req, res, next) {
     req.get('Authorization') || ''
   ).replace(/^Bearer\s+/i, '').trim();
 
+console.log('AUTH DEBUG:', {
+  authorizationPresent: Boolean(req.get('Authorization')),
+  bearerPrefix: /^Bearer\s+/i.test(req.get('Authorization') || ''),
+  xApiKeyPresent: Boolean(req.get('x-api-key')),
+  passwordMatches: bearer === PROXY_API_KEY
+});
+
   if (bearer !== PROXY_API_KEY) {
     return res.status(401).json({
       error: {
