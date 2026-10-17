@@ -1,447 +1,441 @@
 
-// Janitor AI proxy - NVIDIA NIM + OpenRouter
-// Dependencies: express, axios, cors
-
+ // server.js - NVIDIA NIM proxy for Janitor AI
+// Supports GLM 5.3, DeepSeek Flash, Kimi K2.6 and other NVIDIA NIM models.
 const express = require('express');
-const axios = require('axios');
 const cors = require('cors');
+const axios = require('axios');
 
 const app = express();
-
 app.use(cors());
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '25mb' }));
 
 const PORT = process.env.PORT || 3000;
+const API_KEY = process.env.NIM_API_KEY;
+const API_BASE = (process.env.NIM_API_BASE || 'https://integrate.api.nvidia.com/v1').replace(/\/$/, '');
+const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS) || 90000;
+const SHOW_REASONING = process.env.SHOW_REASONING === 'true';
+const ENABLE_THINKING = process.env.ENABLE_THINKING_MODE === 'true';
 
-const PROXY_API_KEY = process.env.PROXY_API_KEY;
-const DEFAULT_MODEL = process.env.DEFAULT_MODEL || '';
-const ROLEPLAY_GUARD = process.env.ROLEPLAY_GUARD !== 'false';
+// Keep at 1 so Janitor AI uses the model you selected.
+const MAX_ATTEMPTS = Math.max(1, Number(process.env.MAX_FALLBACK_ATTEMPTS) || 1);
 
-const providers = {
-  nvidia: {
-    url: process.env.NIM_API_BASE ||
-      'https://integrate.api.nvidia.com/v1',
-    key: process.env.NIM_API_KEY
-  },
-  openrouter: {
-    url: 'https://openrouter.ai/api/v1',
-    key: process.env.OPENROUTER_API_KEY
-  }
+const MODELS = {
+  'glm-5.3': 'z-ai/glm-5.3',
+  'glm-pro': 'z-ai/glm-5.3',
+  'glm-flash': 'z-ai/glm-5.3-flash',
+  'deepseek-flash': 'deepseek-ai/deepseek-v4.1-flash',
+  'deepseek-v4-pro': 'deepseek-ai/deepseek-v4.1-flash',
+  'deepseek-v4-pro-0813': 'deepseek-ai/deepseek-v4.1-flash',
+  'kimi-k2.6': 'moonshotai/kimi-k2.6',
+  'kimi-k3': 'moonshotai/kimi-k3',
+  'kimi': 'moonshotai/kimi-k3',
+  'nemotron-ultra': 'nvidia/nemotron-3-ultra-550b-a55b',
+  'nemotron-super': 'nvidia/nemotron-3-super-120b-a12b',
+  'nemotron-super-vl': 'nvidia/nemotron-3.5-super-vl-120b-a12b',
+  'nemotron-lightning': 'nvidia/nemotron-3.5-lightning-30b-a3b',
+  'step-5': 'stepfun-ai/step-5-preview',
+  'step-flash': 'stepfun-ai/step-5-preview',
+  'gemma': 'google/gemma-4-31b-it',
+  'muse-glimmer': 'meta/muse-glimmer-30b',
+  'laguna': 'poolside/laguna-xs-2.1',
+  'gpt-oss': 'openai/gpt-oss-20b',
+  'mistral-medium': 'mistralai/mistral-large',
+  'mistral-small': 'nvidia/nemotron-3.5-lightning-30b-a3b',
+  'gpt-4': 'z-ai/glm-5.3',
+  'gpt-4o': 'z-ai/glm-5.3',
+  'gpt-4-faster': 'z-ai/glm-5.3-flash',
+  'gpt-4o-mini': 'nvidia/nemotron-3.5-lightning-30b-a3b',
+  'gpt-3.5-turbo': 'nvidia/nemotron-3-ultra-550b-a55b',
+  'claude-3-opus': 'moonshotai/kimi-k3',
+  'claude-3-sonnet': 'openai/gpt-oss-20b',
+  'gemini-pro': 'z-ai/glm-5.3',
+  'minimax': 'z-ai/glm-5.3',
+  'inkling': 'z-ai/glm-5.3'
 };
 
-// Model selection
-// nim: = NVIDIA
-// or: = OpenRouter
+function resolveModel(raw) {
+  let name = String(raw || 'glm-5.3').trim().toLowerCase();
 
-function selectProvider(requestedModel) {
-  let model = String(
-    requestedModel || DEFAULT_MODEL || ''
-  ).trim();
+  if (MODELS[name]) return MODELS[name];
 
-  if (!model) {
-    return {
-      error: 'Set a model name in Janitor AI.'
-    };
+  // Fix bad names such as "nvidia/deepseek-flash".
+  if (name.startsWith('nvidia/') && MODELS[name.slice(7)]) {
+    return MODELS[name.slice(7)];
   }
 
-  let name = 'nvidia';
+  // Allow actual NVIDIA catalog IDs.
+  if (name.includes('/')) return name;
 
-  if (model.startsWith('or:')) {
-    name = 'openrouter';
-    model = model.slice(3);
-  } else if (model.startsWith('openrouter:')) {
-    name = 'openrouter';
-    model = model.slice('openrouter:'.length);
-  } else if (model.startsWith('nim:')) {
-    model = model.slice(4);
-  }
-
-  if (!model) {
-    return { error: 'Model ID cannot be empty.' };
-  }
-
-  return {
-    name,
-    model,
-    ...providers[name]
-  };
-}
-
-// Protect the proxy with a private password.
-
-function authorize(req, res, next) {
-  if (!PROXY_API_KEY) {
-    return res.status(503).json({
-      error: {
-        message: 'Configure PROXY_API_KEY in Render first.'
-      }
-    });
-  }
-
-  const bearer = (
-    req.get('Authorization') || ''
-  ).replace(/^Bearer\s+/i, '').trim();
-
-console.log('AUTH DEBUG:', {
-  authorizationPresent: Boolean(req.get('Authorization')),
-  bearerPrefix: /^Bearer\s+/i.test(req.get('Authorization') || ''),
-  xApiKeyPresent: Boolean(req.get('x-api-key')),
-  passwordMatches: bearer === PROXY_API_KEY
-});
-
-  if (bearer !== PROXY_API_KEY) {
-    return res.status(401).json({
-      error: {
-        message: 'Invalid proxy key. Use PROXY_API_KEY in Janitor AI.'
-      }
-    });
-  }
-
-  next();
-}
-
-// Home endpoint
-
-app.get('/', (req, res) => {
-  res.json({
-    service: 'Janitor AI Proxy',
-    status: 'running',
-    providers: ['NVIDIA', 'OpenRouter'],
-    endpoints: [
-      '/health',
-      '/v1/models',
-      '/v1/chat/completions'
-    ]
-  });
-});
-
-// Health endpoint
-
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    proxy_key_configured: Boolean(PROXY_API_KEY),
-    nvidia_configured: Boolean(providers.nvidia.key),
-    openrouter_configured: Boolean(providers.openrouter.key)
-  });
-});
-
-// List models from provider
-
-app.get('/v1/models', authorize, async (req, res) => {
-  const name =
-    req.query.provider === 'openrouter'
-      ? 'openrouter'
-      : 'nvidia';
-
-  const provider = providers[name];
-
-  if (!provider.key) {
-    return res.status(503).json({
-      error: {
-        message: `${name} API key is not configured.`
-      }
-    });
-  }
-
-  try {
-    const response = await axios.get(
-      `${provider.url}/models`,
-      {
-        headers: {
-          Authorization: `Bearer ${provider.key}`
-        },
-        timeout: 20000
-      }
-    );
-
-    const prefix =
-      name === 'openrouter' ? 'or:' : 'nim:';
-
-    const listing = response.data;
-
-    if (Array.isArray(listing?.data)) {
-      return res.json({
-        ...listing,
-        data: listing.data.map(item => ({
-          ...item,
-          id: prefix + item.id
-        }))
-      });
-    }
-
-    res.json(listing);
-  } catch (error) {
-    const status = error.response?.status || 502;
-
-    res.status(status).json({
-      error: {
-        message: `Could not fetch ${name} models. HTTP ${status}.`
-      }
-    });
-  }
-});
-
-// Roleplay instruction
-
-const GUARD_TEXT =
-  "In roleplay, write only characters controlled by the assistant " +
-  "and scene narration. Never write the user character's dialogue, " +
-  "actions, thoughts, or decisions. Allow the user to respond.";
-
-function messagesForRoleplay(messages) {
-  const result = messages.map(message => ({
-    ...message
-  }));
-
-  if (!ROLEPLAY_GUARD) {
-    return result;
-  }
-
-  const systemIndex = result.findIndex(
-    message =>
-      message.role === 'system' &&
-      typeof message.content === 'string'
+  const error = new Error(
+    `Unknown model: ${name}. Try glm-5.3, deepseek-flash, or kimi-k2.6.`
   );
+  error.status = 400;
+  throw error;
+}
 
-  if (systemIndex >= 0) {
-    result[systemIndex].content +=
-      '\n\n' + GUARD_TEXT;
+const ROLEPLAY_RULES = `Roleplay only as the character established by the conversation and character card.
+Keep the character's personality, beliefs, flaws, speaking style and memories consistent.
+Use believable, natural conversation instead of flowery narration or dramatic speeches.
+Do not assume what the user thinks, feels, says or does. Never write the user's turn.
+Let relationships and emotions evolve naturally, without rushing them.
+End after the character's turn and wait for the user's response.`;
+
+function cleanText(text) {
+  return String(text || '')
+    .split(/\n\s*(?:User|Human|Player)\s*[:：]/i)[0]
+    .trimEnd();
+}
+
+function addRoleplayRules(messages) {
+  const out = messages.map(m => ({ ...m }));
+  const i = out.findIndex(m => m.role === 'system');
+
+  if (i >= 0 && typeof out[i].content === 'string') {
+    out[i].content += '\n\n' + ROLEPLAY_RULES;
   } else {
-    result.unshift({
-      role: 'system',
-      content: GUARD_TEXT
-    });
+    out.unshift({ role: 'system', content: ROLEPLAY_RULES });
   }
 
-  return result;
+  return out;
 }
 
-// Extract actual provider errors
+function enableThinking(request) {
+  if (!ENABLE_THINKING) return;
 
-async function getUpstreamError(error) {
-  let data = error.response?.data;
+  const id = request.model;
 
-  if (data && typeof data.on === 'function') {
-    let message = '';
-
-    try {
-      for await (const chunk of data) {
-        message += chunk.toString();
-
-        if (message.length > 12000) {
-          break;
-        }
-      }
-    } catch (_) {}
-
-    data = message;
+  if (
+    id.startsWith('deepseek-ai/') ||
+    id.startsWith('moonshotai/')
+  ) {
+    request.chat_template_kwargs = { thinking: true };
+  } else if (
+    id.startsWith('z-ai/') ||
+    id.startsWith('nvidia/') ||
+    id.startsWith('stepfun-ai/')
+  ) {
+    request.chat_template_kwargs = { enable_thinking: true };
   }
-
-  if (typeof data === 'string') {
-    try {
-      data = JSON.parse(data);
-    } catch (_) {
-      return data.slice(0, 500);
-    }
-  }
-
-  const value =
-    data?.error?.message ||
-    data?.detail ||
-    error.message ||
-    'Unknown error';
-
-  return typeof value === 'string'
-    ? value.slice(0, 500)
-    : JSON.stringify(value).slice(0, 500);
 }
 
-// Main chat completions endpoint
+const FALLBACKS = [
+  'z-ai/glm-5.3-flash',
+  'deepseek-ai/deepseek-v4.1-flash',
+  'nvidia/nemotron-3.5-lightning-30b-a3b'
+];
 
-app.post(
-  '/v1/chat/completions',
-  authorize,
-  async (req, res) => {
+async function requestNim(body) {
+  const models = [
+    body.model,
+    ...FALLBACKS.filter(id => id !== body.model)
+  ].slice(0, MAX_ATTEMPTS);
 
-    const selected = selectProvider(req.body?.model);
+  let lastError;
 
-    if (selected.error) {
-      return res.status(400).json({
-        error: {
-          message: selected.error
-        }
-      });
-    }
-
-    if (!selected.key) {
-      return res.status(503).json({
-        error: {
-          message: `Missing ${selected.name} API key in Render.`
-        }
-      });
-    }
-
-    if (
-      !Array.isArray(req.body.messages) ||
-      req.body.messages.length === 0
-    ) {
-      return res.status(400).json({
-        error: {
-          message: 'Messages must be a nonempty array.'
-        }
-      });
-    }
-
-    const streaming = req.body.stream === true;
-
-    const configuredCap = Number(
-      process.env.MAX_OUTPUT_TOKENS || 2200
-    );
-
-    const cap =
-      Number.isFinite(configuredCap) &&
-      configuredCap > 0
-        ? Math.floor(configuredCap)
-        : 2200;
-
-    const requestedTokens = Number(
-      req.body.max_tokens
-    );
-
-    const tokens =
-      Number.isFinite(requestedTokens) &&
-      requestedTokens > 0
-        ? requestedTokens
-        : 1600;
-
-    const requestData = {
-      model: selected.model,
-      messages: messagesForRoleplay(
-        req.body.messages
-      ),
-      stream: streaming,
-      max_tokens: Math.min(
-        Math.floor(tokens),
-        cap
-      )
-    };
-
-    if (req.body.temperature != null) {
-      requestData.temperature =
-        req.body.temperature;
-    }
-
-    if (req.body.top_p != null) {
-      requestData.top_p = req.body.top_p;
-    }
-
-    if (req.body.stop != null) {
-      requestData.stop = req.body.stop;
-    }
+  for (const model of models) {
+    const payload = { ...body, model };
+    enableThinking(payload);
 
     try {
-      const upstream = await axios.post(
-        `${selected.url}/chat/completions`,
-        requestData,
+      console.log('Requesting NVIDIA model:', model);
+
+      const response = await axios.post(
+        `${API_BASE}/chat/completions`,
+        payload,
         {
           headers: {
-            Authorization: `Bearer ${selected.key}`,
+            Authorization: `Bearer ${API_KEY}`,
             'Content-Type': 'application/json'
           },
-          timeout: 180000,
-          responseType: streaming
-            ? 'stream'
-            : 'json'
+          responseType: body.stream ? 'stream' : 'json',
+          timeout: TIMEOUT
         }
       );
 
-      // Do not switch models automatically.
+      return { response, usedModel: model };
 
-      if (streaming) {
-        res.status(200);
+    } catch (err) {
+      lastError = err;
 
-        res.setHeader(
-          'Content-Type',
-          'text/event-stream; charset=utf-8'
-        );
-
-        res.setHeader(
-          'Cache-Control',
-          'no-cache, no-transform'
-        );
-
-        res.setHeader(
-          'X-Accel-Buffering',
-          'no'
-        );
-
-        upstream.data.on('error', err => {
-          console.error(
-            'Upstream stream interrupted:',
-            err.message
-          );
-
-          res.end();
-        });
-
-        upstream.data.pipe(res);
-      } else {
-        res.json(upstream.data);
-      }
-
-    } catch (error) {
-      const status =
-        error.response?.status || 502;
-
-      const detail =
-        await getUpstreamError(error);
-
-      console.error(
-        `Upstream ${selected.name} (${selected.model}) HTTP ${status}: ${detail}`
-      );
-
-      if (!res.headersSent) {
-        res.status(status).json({
-          error: {
-            message:
-              `${selected.name}/${selected.model}: ${detail}`,
-            code: status
-          }
-        });
-      } else {
-        res.end();
+      if (
+        ![404, 410, 429, 500, 502, 503, 504].includes(
+          err.response?.status
+        ) && err.code !== 'ECONNABORTED'
+      ) {
+        break;
       }
     }
   }
-);
 
-// Unsupported routes
+  throw lastError;
+}
 
-app.use((req, res) => {
-  res.status(404).json({
-    error: {
-      message: 'Endpoint not found.'
-    }
-  });
+app.get('/', (_req, res) => res.json({
+  service: 'Janitor AI NVIDIA NIM Proxy',
+  version: '3.1-multi-model',
+  models: {
+    'glm-5.3': MODELS['glm-5.3'],
+    'deepseek-flash': MODELS['deepseek-flash'],
+    'kimi-k2.6': MODELS['kimi-k2.6']
+  },
+  endpoint: '/v1/chat/completions'
+}));
+
+app.get('/health', (_req, res) => res.json({
+  status: 'ok',
+  version: '3.1-multi-model',
+  api_key_configured: !!API_KEY
+}));
+
+app.get('/resolve-model', (req, res) => {
+  try {
+    res.json({
+      requested: req.query.model || 'glm-5.3',
+      resolved: resolveModel(req.query.model)
+    });
+  } catch (err) {
+    res.status(err.status || 400).json({
+      error: err.message
+    });
+  }
 });
 
-// Start server
+app.get('/v1/models', (_req, res) => res.json({
+  object: 'list',
+  data: Object.keys(MODELS).map(id => ({
+    id,
+    object: 'model',
+    owned_by: 'nvidia-nim-proxy'
+  }))
+}));
+
+app.post('/v1/chat/completions', async (req, res) => {
+  try {
+    if (!API_KEY) {
+      return res.status(500).json({
+        error: {
+          message: 'Set NIM_API_KEY in Render Environment.'
+        }
+      });
+    }
+
+    const {
+      model,
+      messages,
+      stream,
+      temperature,
+      max_tokens,
+      top_p,
+      frequency_penalty,
+      presence_penalty,
+      stop,
+      seed
+    } = req.body || {};
+
+    if (!Array.isArray(messages) || !messages.length) {
+      return res.status(400).json({
+        error: {
+          message: 'messages must be a nonempty array.'
+        }
+      });
+    }
+
+    const payload = {
+      model: resolveModel(model),
+      messages: addRoleplayRules(messages),
+      stream: stream === true,
+      temperature: temperature ?? 0.75,
+      max_tokens: max_tokens ?? 1200
+    };
+
+    for (const [key, value] of Object.entries({
+      top_p,
+      frequency_penalty,
+      presence_penalty,
+      stop,
+      seed
+    })) {
+      if (value !== undefined) {
+        payload[key] = value;
+      }
+    }
+
+    const { response, usedModel } = await requestNim(payload);
+
+    if (!payload.stream) {
+      const data = response.data;
+
+      if (Array.isArray(data.choices)) {
+        data.choices = data.choices.map(choice => ({
+          ...choice,
+          message: {
+            ...choice.message,
+            content: cleanText(choice.message?.content),
+            ...(SHOW_REASONING ? {} : {
+              reasoning: undefined,
+              reasoning_content: undefined
+            })
+          }
+        }));
+      }
+
+      data.model = usedModel;
+      return res.json(data);
+    }
+
+    // OpenAI-compatible streaming responses.
+    res.setHeader(
+      'Content-Type',
+      'text/event-stream; charset=utf-8'
+    );
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    let buffer = '';
+    let pending = '';
+    let finished = false;
+    let stopped = false;
+
+    const send = content => {
+      if (!content || res.writableEnded) return;
+
+      res.write(`data: ${JSON.stringify({
+        object: 'chat.completion.chunk',
+        model: usedModel,
+        choices: [{
+          index: 0,
+          delta: { content },
+          finish_reason: null
+        }]
+      })}\n\n`);
+    };
+
+    const flush = final => {
+      if (stopped && !final) return;
+
+      const match =
+        /(?:^|\n)\s*(?:User|Human|Player)\s*[:：]/i.exec(
+          pending
+        );
+
+      if (match) {
+        pending = pending.slice(0, match.index);
+        stopped = true;
+        final = true;
+      }
+
+      const count = final
+        ? pending.length
+        : Math.max(0, pending.length - 180);
+
+      if (count) {
+        send(pending.slice(0, count));
+        pending = pending.slice(count);
+      }
+    };
+
+    const finish = () => {
+      if (finished) return;
+
+      finished = true;
+      flush(true);
+
+      res.write(`data: ${JSON.stringify({
+        object: 'chat.completion.chunk',
+        model: usedModel,
+        choices: [{
+          index: 0,
+          delta: {},
+          finish_reason: 'stop'
+        }]
+      })}\n\n`);
+
+      res.end('data: [DONE]\n\n');
+    };
+
+    response.data.on('data', chunk => {
+      buffer += chunk.toString();
+
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop();
+
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+
+        const raw = line.slice(5).trim();
+
+        if (raw === '[DONE]') {
+          finish();
+          return;
+        }
+
+        try {
+          const parsed = JSON.parse(raw);
+          const delta = parsed.choices?.[0]?.delta || {};
+
+          if (stopped) continue;
+
+          if (SHOW_REASONING) {
+            pending +=
+              delta.reasoning_content ||
+              delta.reasoning ||
+              '';
+          }
+
+          if (typeof delta.content === 'string') {
+            pending += delta.content;
+          }
+
+          flush(false);
+
+        } catch {
+          // Ignore malformed streaming lines.
+        }
+      }
+    });
+
+    response.data.on('end', finish);
+
+    response.data.on('error', err => {
+      console.error(
+        'Upstream streaming error:',
+        err.message
+      );
+      finish();
+    });
+
+  } catch (err) {
+    const status =
+      err.status ||
+      err.response?.status ||
+      500;
+
+    console.error(
+      'NVIDIA proxy error:',
+      status,
+      err.message
+    );
+
+    if (!res.headersSent) {
+      res.status(status).json({
+        error: {
+          message:
+            err.response?.data?.detail ||
+            err.message,
+          code: status
+        }
+      });
+    } else {
+      res.end();
+    }
+  }
+});
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(
-    `Janitor AI proxy listening on port ${PORT}`
+    `Janitor AI proxy 3.1-multi-model listening on ${PORT}`
   );
-
   console.log(
-    `NVIDIA configured: ${Boolean(providers.nvidia.key)}`
-  );
-
-  console.log(
-    `OpenRouter configured: ${Boolean(providers.openrouter.key)}`
-  );
-
-  console.log(
-    `Proxy password configured: ${Boolean(PROXY_API_KEY)}`
+    'Models: glm-5.3, deepseek-flash, kimi-k2.6'
   );
 });
